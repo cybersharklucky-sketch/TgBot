@@ -1,115 +1,101 @@
-# crosspromo_bot.py
-# Fully Fixed Advanced Cross-Promo Telegram Bot
-# Works on python-telegram-bot v21+
-# Compatible with Termux and Linux
-# ----------------------------------------------
+# crosspromo_bot_v5_ai.py
+# Advanced Cross-Promotion Bot with Analytics, AI Timings & Admin Panel
+# Works on Termux / Python 3.10+
 
 import asyncio
 import sqlite3
-import html
 import random
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
-    JobQueue,
     ChatMemberHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
-import re
 
-# --------- CONFIG ----------
-BOT_TOKEN = "8202116916:AAEexk7394fP6mPzpbWmTEzEqDZkSzF3fXw"  # Replace with your bot token
-OWNER_USERNAME = "@SharkXOFC"       # Replace with your Telegram username
-DB = "crosspromo.db"
-KEYWORDS = ["download", "username", "password"]
-PROMO_TEMPLATE = (
-    "🔥 Partner Channel of the Day:\n👉 {link}\n"
-    "Join Now For Exclusive Antiban Hacks\n\n{extra}"
-)
-# ---------------------------
+# ───────────────────────────────
+BOT_TOKEN = "8346086880:AAGuxG4sQveDlPfBkefka01Isq5YFF0qbdw"
+OWNER_ID = 8053084391
+DB = "promo_ai_bot.db"
+OWNER_CHANNEL = "https://t.me/SharkXPanels"
+PROMO_INTERVAL = 4 * 3600  # every 4 hours
+SEND_BATCH = 100
+# ───────────────────────────────
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("CrossPromoBot")
 
-# ---------- DATABASE SETUP ----------
+REGISTER_NAME, REGISTER_PASS, LOGIN_NAME, LOGIN_PASS = range(4)
+
+
+# ───────────────────────────────
+# Database Setup
+# ───────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            username TEXT,
-            password TEXT,
-            created_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            username TEXT,
-            invite_link TEXT,
-            added_by INTEGER,
-            added_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT,
-            from_chat INTEGER,
-            to_chat INTEGER,
-            message TEXT
-        )
-    """)
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        tg_id INTEGER PRIMARY KEY,
+        username TEXT,
+        password TEXT,
+        joined_at TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS channels (
+        chat_id INTEGER PRIMARY KEY,
+        title TEXT,
+        username TEXT,
+        invite_link TEXT,
+        added_by INTEGER,
+        added_at TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        from_chat INTEGER,
+        to_chat INTEGER,
+        message TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        promo_sent INTEGER DEFAULT 0,
+        promo_received INTEGER DEFAULT 0,
+        last_promo TEXT
+    )""")
     conn.commit()
     conn.close()
 
-def add_user(tg_id, username, password):
+
+# ───────────────────────────────
+# DB Helpers
+# ───────────────────────────────
+def add_user(tg_id, name, password):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO users (tg_id, username, password, created_at) VALUES (?, ?, ?, ?)",
-        (tg_id, username, password, datetime.utcnow().isoformat())
+        "INSERT OR REPLACE INTO users (tg_id, username, password, joined_at) VALUES (?, ?, ?, ?)",
+        (tg_id, name, password, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
 
-def count_users():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    count = cur.fetchone()[0]
-    conn.close()
-    return count
 
-def add_channel(chat_id, title, username, added_by=None):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO channels (chat_id, title, username, invite_link, added_by, added_at)
-        VALUES (?, ?, ?, COALESCE((SELECT invite_link FROM channels WHERE chat_id = ?), ''), ?, ?)
-    """, (chat_id, title, username or "", chat_id, added_by, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-def remove_channel(chat_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM channels WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-def list_channels():
+def get_channels():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("SELECT chat_id, title, username, invite_link FROM channels")
@@ -117,189 +103,263 @@ def list_channels():
     conn.close()
     return rows
 
-def set_invite_link(chat_id, link):
+
+def add_channel(chat_id, title, username, added_by):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("UPDATE channels SET invite_link = ? WHERE chat_id = ?", (link, chat_id))
+    cur.execute(
+        "INSERT OR REPLACE INTO channels (chat_id, title, username, added_by, added_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, title, username, added_by, datetime.utcnow().isoformat()),
+    )
     conn.commit()
     conn.close()
 
-def log_promo(from_chat, to_chat, msg):
+
+def record_promo(from_chat, to_chat, message):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO logs (ts, from_chat, to_chat, message) VALUES (?, ?, ?, ?)",
-        (datetime.utcnow().isoformat(), from_chat, to_chat, msg)
+        (datetime.utcnow().isoformat(), from_chat, to_chat, message),
     )
     conn.commit()
     conn.close()
 
-# ---------- UTILITIES ----------
-def is_owner(update: Update):
-    return update.effective_user and update.effective_user.username and ("@" + update.effective_user.username) == OWNER_USERNAME
 
-def build_channel_link(chat_id, username, invite):
-    if username:
-        return f"https://t.me/{username}"
+# ───────────────────────────────
+# Utility Functions
+# ───────────────────────────────
+def build_link(chat_id, username, invite):
     if invite:
         return invite
+    if username:
+        return f"https://t.me/{username}"
     if str(chat_id).startswith("-100"):
-        return f"https://t.me/c/{str(chat_id).replace('-100', '')}"
+        return f"https://t.me/c/{str(chat_id).replace('-100','')}"
     return f"https://t.me/c/{chat_id}"
 
-# ---------- COMMAND HANDLERS ----------
+
+def is_owner(update):
+    return update.effective_user and update.effective_user.id == OWNER_ID
+
+
+# ───────────────────────────────
+# Conversation: Register/Login
+# ───────────────────────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        f"👋 Welcome to CrossPromo Bot\n\n"
-        f"👑 Owner: {OWNER_USERNAME}\n\n"
-        "🧩 Commands:\n"
-        "/register <username> <password>\n"
-        "/login <username> <password>\n\n"
-        "📢 Owner-only commands:\n"
-        "/stats, /channels, /addInvite <chat_id> <link>\n"
-        "/sendPostAll <text>, /broadcastUsers <text>, /postNow\n\n"
-        "To register a channel, add this bot as ADMIN with 'Post Messages' permission."
+    user_id = update.effective_user.id
+    text = "👋 Welcome to *Cross Promotion Network Bot*\n\nSelect an option:"
+    keyboard = [
+        [InlineKeyboardButton("📝 Register", callback_data="register")],
+        [InlineKeyboardButton("🔐 Login", callback_data="login")],
+        [InlineKeyboardButton("📣 Join Owner Channel", url=OWNER_CHANNEL)],
+    ]
+    if user_id == OWNER_ID:
+        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_menu")])
+
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    await update.message.reply_text(msg)
 
-async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /register <username> <password>")
-    add_user(update.effective_user.id, context.args[0], context.args[1])
-    await update.message.reply_text("✅ Account created successfully!")
 
-async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /login <username> <password>")
+# Register Flow
+async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Enter your desired *username*:", parse_mode=ParseMode.MARKDOWN)
+    return REGISTER_NAME
+
+
+async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["reg_name"] = update.message.text
+    await update.message.reply_text("Now enter a *password*:", parse_mode=ParseMode.MARKDOWN)
+    return REGISTER_PASS
+
+
+async def reg_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data["reg_name"]
+    password = update.message.text
+    add_user(update.effective_user.id, name, password)
+    await update.message.reply_text("✅ Registration successful! Use /start again to open your menu.")
+    return ConversationHandler.END
+
+
+# Login Flow
+async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Enter your *username*:", parse_mode=ParseMode.MARKDOWN)
+    return LOGIN_NAME
+
+
+async def login_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["login_name"] = update.message.text
+    await update.message.reply_text("Enter your *password*:")
+    return LOGIN_PASS
+
+
+async def login_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data["login_name"]
+    password = update.message.text
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username=? AND password=?", (context.args[0], context.args[1]))
-    r = cur.fetchone()
+    cur.execute("SELECT * FROM users WHERE username=? AND password=?", (name, password))
+    row = cur.fetchone()
     conn.close()
-    if r:
-        await update.message.reply_text("✅ Login successful!")
+    if row:
+        await update.message.reply_text("✅ Login successful! Use /start again to access your panel.")
     else:
         await update.message.reply_text("❌ Invalid credentials.")
+    return ConversationHandler.END
 
-# ✅ FIXED HANDLER FOR BOT ADMIN ADDITION
-async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        m = update.my_chat_member
-        chat = m.chat
-        new_status = m.new_chat_member
-        if chat.type == "channel" and new_status.status == "administrator":
-            add_channel(chat.id, chat.title or "", chat.username or "", update.effective_user.id if update.effective_user else None)
-            await context.bot.send_message(chat.id, "✅ This channel is now registered for cross-promotion.")
-            logger.info("Added channel: %s (%s)", chat.title, chat.id)
-        elif new_status.status in ("left", "kicked"):
-            remove_channel(chat.id)
-            logger.info("Removed channel: %s", chat.id)
-    except Exception as e:
-        logger.exception("Error in my_chat_member: %s", e)
 
-async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ───────────────────────────────
+# AI Smart Promo System
+# ───────────────────────────────
+async def ai_promo_system(context: ContextTypes.DEFAULT_TYPE):
+    """Auto-schedules and randomizes promotions intelligently."""
+    channels = get_channels()
+    if len(channels) < 2:
+        return
+
+    now = datetime.utcnow().hour
+    delay_factor = random.uniform(0.6, 1.3)
+    sleep_time = random.randint(2, 6)
+
+    # Avoid burst in late hours (2AM–6AM)
+    if 2 <= now <= 6:
+        logger.info("🕐 Sleeping during low activity hours...")
+        return
+
+    random.shuffle(channels)
+    groups = [channels[i:i + SEND_BATCH] for i in range(0, len(channels), SEND_BATCH)]
+
+    for group in groups:
+        for src in group:
+            tgt = random.choice(channels)
+            if src[0] == tgt[0]:
+                continue
+            link = build_link(tgt[0], tgt[2], tgt[3])
+            msg = f"🔥 Partner of the Day: [{tgt[1]}]({link})\nJoin and boost your reach!"
+            try:
+                await context.bot.send_message(src[0], msg, parse_mode=ParseMode.MARKDOWN)
+                record_promo(src[0], tgt[0], msg)
+                await asyncio.sleep(sleep_time * delay_factor)
+            except Exception as e:
+                logger.warning(f"Promo failed in {src[1]}: {e}")
+
+
+# ───────────────────────────────
+# Admin Panel
+# ───────────────────────────────
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
-        return await update.message.reply_text("❌ Owner only.")
-    chs = list_channels()
-    if not chs:
-        return await update.message.reply_text("No channels registered.")
-    txt = "📋 Registered Channels:\n\n"
-    for cid, title, uname, inv in chs:
-        txt += f"{title} | @{uname or 'no_username'} | ID: {cid}\n"
-    await update.message.reply_text(txt)
+        return
+    await update.callback_query.answer()
+    text = "⚙️ *Admin Control Panel*\nSelect an action:"
+    buttons = [
+        [InlineKeyboardButton("📊 Analytics", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 Force Promotion Now", callback_data="admin_promo")],
+        [InlineKeyboardButton("🗂 Channels List", callback_data="admin_channels")],
+    ]
+    await update.callback_query.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("❌ Owner only.")
-    await update.message.reply_text(f"📊 Total Channels: {len(list_channels())}\n👥 Total Users: {count_users()}")
 
-async def add_invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("❌ Owner only.")
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /addInvite <chat_id> <invite_link>")
-    set_invite_link(int(context.args[0]), context.args[1])
-    await update.message.reply_text("✅ Invite link added.")
-
-async def send_post_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("❌ Owner only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /sendPostAll <text>")
-    text = " ".join(context.args)
-    chs = list_channels()
-    if not chs:
-        return await update.message.reply_text("No channels registered.")
-    for i, src in enumerate(chs):
-        tgt = chs[(i + 1) % len(chs)]
-        link = build_channel_link(tgt[0], tgt[2], tgt[3])
-        msg = text
-        for kw in KEYWORDS:
-            msg = re.sub(rf"(?i){kw}", f'<a href="{html.escape(link)}">{kw}</a>', msg)
-        try:
-            await context.bot.send_message(src[0], msg, parse_mode=ParseMode.HTML)
-            log_promo(src[0], tgt[0], text)
-        except Exception as e:
-            logger.warning("Failed send to %s: %s", src[0], e)
-    await update.message.reply_text("✅ Sent to all channels with link replacements.")
-
-async def broadcast_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("❌ Owner only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /broadcastUsers <text>")
-    text = " ".join(context.args)
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT tg_id FROM users")
-    users = cur.fetchall()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM channels")
+    total_channels = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM logs")
+    total_logs = cur.fetchone()[0]
     conn.close()
-    for u in users:
-        try:
-            await context.bot.send_message(u[0], text)
-        except:
-            pass
-    await update.message.reply_text("✅ Broadcast complete.")
 
-async def cross_promo_once(context: ContextTypes.DEFAULT_TYPE):
-    chs = list_channels()
-    if len(chs) < 2:
-        return
-    for i, src in enumerate(chs):
-        tgt = chs[(i + 1) % len(chs)]
-        link = build_channel_link(tgt[0], tgt[2], tgt[3])
-        extra = f"Promoting: {tgt[1]}"
-        promo = PROMO_TEMPLATE.format(link=link, extra=extra)
-        try:
-            await context.bot.send_message(src[0], promo, parse_mode=ParseMode.HTML)
-            log_promo(src[0], tgt[0], promo)
-        except Exception as e:
-            logger.warning("Cross-promo failed: %s", e)
+    msg = (
+        f"📊 *Bot Analytics:*\n"
+        f"👥 Users: {total_users}\n"
+        f"📣 Channels: {total_channels}\n"
+        f"🚀 Promotions Logged: {total_logs}\n"
+        f"🕐 Updated: {datetime.now().strftime('%H:%M:%S')}"
+    )
+    await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-# ---------- MAIN ----------
+
+async def admin_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    chs = get_channels()
+    msg = "🗂 *Registered Channels:*\n\n"
+    for c in chs:
+        msg += f"• {c[1]} (`{c[2] or 'No username'}`)\n"
+    await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def admin_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("Running promotion...")
+    await ai_promo_system(context)
+    await update.callback_query.message.reply_text("✅ Promotion batch executed successfully!")
+
+
+# ───────────────────────────────
+# Channel Admin Handler
+# ───────────────────────────────
+async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.my_chat_member
+    chat = m.chat
+    if chat.type == "channel" and m.new_chat_member.status == "administrator":
+        add_channel(chat.id, chat.title or "Unnamed", chat.username or None, update.effective_user.id)
+        await context.bot.send_message(chat.id, "✅ Channel registered for cross-promotion!")
+
+
+# ───────────────────────────────
+# Main
+# ───────────────────────────────
 def main():
     init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    job_queue = JobQueue()
-    app = ApplicationBuilder().token(BOT_TOKEN).job_queue(job_queue).build()
-    job_queue.set_application(app)
-
+    # Core commands
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("register", register_cmd))
-    app.add_handler(CommandHandler("login", login_cmd))
-    app.add_handler(CommandHandler("channels", channels_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("addInvite", add_invite_cmd))
-    app.add_handler(CommandHandler("sendPostAll", send_post_all_cmd))
-    app.add_handler(CommandHandler("broadcastUsers", broadcast_users_cmd))
-
-    # ✅ FIXED: Proper handler for bot being added/removed as admin
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    job_queue.run_repeating(cross_promo_once, interval=21600, first=10)  # every 6h
+    # Inline callbacks
+    app.add_handler(CallbackQueryHandler(reg_start, pattern="register"))
+    app.add_handler(CallbackQueryHandler(login_start, pattern="login"))
+    app.add_handler(CallbackQueryHandler(admin_menu, pattern="admin_menu"))
+    app.add_handler(CallbackQueryHandler(admin_stats, pattern="admin_stats"))
+    app.add_handler(CallbackQueryHandler(admin_channels, pattern="admin_channels"))
+    app.add_handler(CallbackQueryHandler(admin_promo, pattern="admin_promo"))
 
-    logger.info("🤖 Bot started successfully!")
+    # Conversations
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(reg_start, pattern="register")],
+            states={
+                REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
+                REGISTER_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_pass)],
+            },
+            fallbacks=[],
+        )
+    )
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(login_start, pattern="login")],
+            states={
+                LOGIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_name)],
+                LOGIN_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_pass)],
+            },
+            fallbacks=[],
+        )
+    )
+
+    # Schedule AI promo job
+    app.job_queue.run_repeating(ai_promo_system, interval=PROMO_INTERVAL, first=10)
+
+    logger.info("🤖 CrossPromo AI Bot is running...")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
