@@ -1,5 +1,2 @@
-python-telegram-bot==21.6
-apscheduler
-requests
-joblib
-python-dotenv
+pip install flask
+pip install requests
