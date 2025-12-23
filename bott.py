@@ -19,11 +19,17 @@ def extract():
 
     formats = []
     for f in info.get("formats", []):
-        if f.get("ext") == "mp4" and f.get("height") in [360, 720]:
-            formats.append({
-                "quality": f"{f.get('height')}p",
-                "url": f.get("url")
-            })
+    # ONLY progressive MP4 (video + audio)
+    if (
+        f.get("ext") == "mp4"
+        and f.get("acodec") != "none"
+        and f.get("vcodec") != "none"
+        and f.get("height") in [360, 720]
+    ):
+        formats.append({
+            "quality": f"{f.get('height')}p",
+            "url": f.get("url")
+        })
 
     return jsonify({
         "title": info.get("title"),
