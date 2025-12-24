@@ -7,7 +7,6 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "ok",
-        "message": "YouTube Video Extract API",
         "endpoint": "/extract?url=YOUTUBE_URL"
     })
 
@@ -24,7 +23,19 @@ def extract():
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
-        "no_warnings": True
+        "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile Safari/537.36"
+            )
+        }
     }
 
     try:
@@ -34,7 +45,7 @@ def extract():
         formats = []
 
         for f in info.get("formats", []):
-            # ONLY progressive MP4 (video + audio)
+            # Progressive MP4 only (video + audio)
             if (
                 f.get("ext") == "mp4"
                 and f.get("acodec") != "none"
